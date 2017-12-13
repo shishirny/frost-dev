@@ -22,7 +22,7 @@ classdef CLFQP < Controller
     
     methods
         
-        function obj = CLFQP(name)
+        function obj = CLFQP(name,flippy,params)
             % The controller class constructor function
             %
             % Parameters:
@@ -30,9 +30,58 @@ classdef CLFQP < Controller
             
             % call superclass constructor
             obj = obj@Controller(name);
-            warning('P matrix from the Ricatti equation not verified for relative degree one outputs and not efficiently computed');
-%             error('This class has not been completely defined yet.');
+
+            y = struct2array(flippy.VirtualConstraints);
+            ny = length(y);
             
+            % total dimension of the virtual constraints
+            dim_y = sum([y.Dimension]);
+            % total dimension of outputs (including relative degrees)
+            dim_eta = sum([y.Dimension.*y.RelativeDegree]);
+            
+            % some constants required for CLF
+            F_mat = zeros(dim_eta);
+            G_mat = zeros(dim_eta,dim_y);
+            I_mat = eye(dim_eta);
+            
+            idx = 1;
+            etaidx = 1;
+            for i=1:ny
+                y_i = y(i);
+                
+                % control gain (k0,k1,...kN-1) for the feedback term
+                if isfield(params, 'epsilon')
+                    ep = params.epsilon;
+                else
+                    ep = 1;
+                end
+                
+                
+                % stack the partial derivatives of all outputs
+                y_indices = idx:idx+y_i.Dimension-1;
+                eta_indices = etaidx:etaidx+y_i.Dimension-1;
+                
+                G_mat(eta_indices+(y_i.RelativeDegree-1)*numel(eta_indices),y_indices) = eye(y_i.Dimension);
+                
+                if y_i.RelativeDegree > 1 % only modify the first degree outputs (0th derivative). not higher derivatives
+                    I_mat(eta_indices,eta_indices) = ep*eye(numel(eta_indices));
+                end
+                
+                for j=1:y_i.RelativeDegree
+                    if j < y_i.RelativeDegree
+                        F_mat(eta_indices+(j-1)*numel(eta_indices),eta_indices+j*numel(eta_indices)) = eye(numel(eta_indices));
+                    end
+                end
+                % update the starting index for the next output
+                idx = idx+y_i.Dimension;
+                etaidx = etaidx+y_i.Dimension*y_i.RelativeDegree;
+            end
+            
+            P = care(F_mat,G_mat,eye(dim_eta));
+
+            obj.Param.F_mat = F_mat;
+            obj.Param.G_mat = G_mat;
+            obj.Param.Pe_mat = I_mat'*P*I_mat;
         end
         
         
@@ -73,9 +122,9 @@ classdef CLFQP < Controller
             % total dimension of outputs (including relative degrees)
             dim_eta = sum([y.Dimension.*y.RelativeDegree]);
             % some constants required for CLF
-            F_mat = zeros(dim_eta);
-            G_mat = zeros(dim_eta,dim_y);
-            I_mat = eye(dim_eta);
+            F_mat = obj.Param.F_mat;
+            G_mat = obj.Param.G_mat;
+            Pep = obj.Param.Pe_mat;
             % partial derivative of the highest order of derivative (y^n-1) w.r.t.
             % the state variable 'x'
             DLfy = zeros(dim_y,length(x));   % A = DLfy*gfc; Lf = DLfy*vfc;
@@ -125,32 +174,21 @@ classdef CLFQP < Controller
                 tau{i} = calcPhaseVariable(y_i, t, q, dq, p);
                 
                 
-                
-                
                 % control gain (k0,k1,...kN-1) for the feedback term
                 if isfield(params, 'epsilon')
                     ep = params.epsilon;
-                    K = ones(1, y_i.RelativeDegree);
-                    for l= 1:y_i.RelativeDegree
-                        K(l) = nchoosek(y_i.RelativeDegree,l-1)*ep^(y_i.RelativeDegree - l + 1);
-                    end
-                    
-                    
                 else
-                    error('The control gain %s has not been specified in the ''params'' argument.\n', control_param);
+                    ep = 1;
                 end
-                
+                K = ones(1, y_i.RelativeDegree);
+                for l= 1:y_i.RelativeDegree
+                    K(l) = nchoosek(y_i.RelativeDegree,l-1)*ep^(y_i.RelativeDegree - l + 1);
+                end
                 
                 % stack the partial derivatives of all outputs
                 y_indices = idx:idx+y_i.Dimension-1;
                 eta_indices = etaidx:etaidx+y_i.Dimension-1;
-                
-                G_mat(eta_indices+(y_i.RelativeDegree-1)*numel(eta_indices),y_indices) = eye(y_i.Dimension);
-                
-                if y_i.RelativeDegree > 1 % only modify the first degree outputs (0th derivative). not higher derivatives
-                    I_mat(eta_indices,eta_indices) = ep*eye(numel(eta_indices));
-                end
-                
+                                
                 if strcmp(y_i.PhaseType, 'TimeBased')
                     DLfy(y_indices,:) = y_a{i}{end};
                     ddy(y_indices) = y_d{i}{end};
@@ -160,16 +198,11 @@ classdef CLFQP < Controller
                 for j=1:y_i.RelativeDegree
                     mu(y_indices) = mu(y_indices) + K(j)*(y_a{i}{j}-y_d{i}{j});
                     eta(eta_indices+(j-1)*numel(eta_indices)) = y_a{i}{j} - y_d{i}{j};
-                    
-                    if j < y_i.RelativeDegree
-                        F_mat(eta_indices+(j-1)*numel(eta_indices),eta_indices+j*numel(eta_indices)) = eye(numel(eta_indices));
-                    end
                 end
                 % update the starting index for the next output
                 idx = idx+y_i.Dimension;
                 etaidx = etaidx+y_i.Dimension*y_i.RelativeDegree;
             end
-            
             
             
             %% here is where the CLF based controller is designed 
@@ -179,20 +212,14 @@ classdef CLFQP < Controller
             Lf_mat = DLfy*vfc;
             
             % Lyapunov function
-            P = care(F_mat,G_mat,eye(dim_eta));
-            Pep = I_mat' * P * I_mat;
             Veta = eta' * Pep * eta;
-            
-%             % CLF V for mu
-%             LgVetamu = 2*eta'*Pep*G_mat;
-%             LfVetamu = eta'*(F_mat'*Pep + Pep*F_mat)*eta + 0.3660*ep*Veta; 
             
             % CLF V for u
             LgVetau = 2*eta'*Pep*G_mat*A_mat;
             LfVetau = eta'*(F_mat'*Pep+Pep*F_mat)*eta+0.3660*ep*Veta+2*eta'*Pep*G_mat*Lf_mat-2*eta'*Pep*G_mat*ddy;
             
             Hmat = A_mat' * A_mat;
-            
+                
             % feedforward controller
             if strcmp(y_i.PhaseType, 'TimeBased')
                 bmat = Lf_mat'*A_mat - ddy'*A_mat;
